@@ -1,4 +1,4 @@
--module(rebar_prv_compile).
+-module(rebar_prv_compile_deps).
 
 -behaviour(provider).
 
@@ -12,7 +12,7 @@
 -include_lib("providers/include/providers.hrl").
 -include("rebar.hrl").
 
--define(PROVIDER, compile).
+-define(PROVIDER, 'compile-deps').
 -define(ERLC_HOOK, erlc_compile).
 -define(APP_HOOK, app_compile).
 -define(DEPS, [lock]).
@@ -27,22 +27,11 @@ init(State) ->
                                                                {module, ?MODULE},
                                                                {bare, true},
                                                                {deps, ?DEPS},
-                                                               {example, "rebar3 compile"},
-                                                               {short_desc, "Compile apps .app.src and .erl files."},
-                                                               {desc, "Compile apps .app.src and .erl files."},
-                                                               {opts, [
-                                                                 {only_deps, $d, "deps-only", undefined, "Compile only dependencies."}
-                                                               ]}])),
+                                                               {example, "rebar3 compile-deps"},
+                                                               {short_desc, "Compile only the dependencies."},
+                                                               {desc, "Compile only the dependencies."},
+                                                               {opts, []}])),
     {ok, State1}.
-
-
-compile_type(State) ->
-    {Args, _} = rebar_state:command_parsed_args(State),
-    case proplists:get_value(only_deps, Args) of
-        undefined -> all;
-        _ -> only_deps
-    end.
-
 
 -spec do(rebar_state:t()) -> {ok, rebar_state:t()} | {error, string()}.
 do(State) ->
@@ -51,42 +40,17 @@ do(State) ->
     rebar_utils:remove_from_code_path(PluginDepsPaths),
     code:add_pathsa(DepsPaths),
 
+    ProjectApps = rebar_state:project_apps(State),
     Providers = rebar_state:providers(State),
     Deps = rebar_state:deps_to_build(State),
+    Cwd = rebar_state:dir(State),
 
     copy_and_build_apps(State, Providers, Deps),
-    case compile_type(State) of
-        only_deps ->
-            {ok, State};
-        all ->
-            ProjectApps = rebar_state:project_apps(State),
-            Providers = rebar_state:providers(State),
-            Cwd = rebar_state:dir(State),
-            copy_and_build_apps(State, Providers, Deps),
-            {ok, ProjectApps1} = rebar_digraph:compile_order(ProjectApps),
+    {ok, _} = rebar_digraph:compile_order(ProjectApps),
 
-            %% Run top level hooks *before* project apps compiled but *after* deps are
-            rebar_hooks:run_all_hooks(Cwd, pre, ?PROVIDER, Providers, State),
-
-            ProjectApps2 = copy_and_build_project_apps(State, Providers, ProjectApps1),
-            State2 = rebar_state:project_apps(State, ProjectApps2),
-
-            %% projects with structures like /apps/foo,/apps/bar,/test
-            build_extra_dirs(State, ProjectApps2),
-
-            State3 = update_code_paths(State2, ProjectApps2, DepsPaths),
-
-            rebar_hooks:run_all_hooks(Cwd, post, ?PROVIDER, Providers, State2),
-            case rebar_state:has_all_artifacts(State3) of
-                {false, File} ->
-                    throw(?PRV_ERROR({missing_artifact, File}));
-                true ->
-                    true
-            end,
-            rebar_utils:cleanup_code_path(rebar_state:code_paths(State3, default)
-                                         ++ rebar_state:code_paths(State, all_plugin_deps)),
-            {ok, State3}
-    end.
+    %% Run top level hooks *before* project apps compiled but *after* deps are
+    rebar_hooks:run_all_hooks(Cwd, pre, ?PROVIDER, Providers, State),
+    {ok, State}.
 
 -spec format_error(any()) -> iolist().
 format_error({missing_artifact, File}) ->
@@ -103,42 +67,6 @@ build_app(State, Providers, AppInfo) ->
     copy_app_dirs(AppInfo, AppDir, OutDir),
     compile(State, Providers, AppInfo).
 
-copy_and_build_project_apps(State, Providers, Apps) ->
-    %% Top-level apps, because of profile usage and specific orderings (i.e.
-    %% may require an include file from a profile-specific app for an extra_dirs
-    %% entry that only exists in a test context), need to be
-    %% copied and added to the path at once, and not just in compile order.
-    [copy_app_dirs(AppInfo,
-                   rebar_app_info:dir(AppInfo),
-                   rebar_app_info:out_dir(AppInfo))
-     || AppInfo <- Apps],
-    code:add_pathsa([rebar_app_info:out_dir(AppInfo) || AppInfo <- Apps]),
-    [compile(State, Providers, AppInfo) || AppInfo <- Apps].
-
-
-build_extra_dirs(State, Apps) ->
-    BaseDir = rebar_state:dir(State),
-    F = fun(App) -> rebar_app_info:dir(App) == BaseDir end,
-    %% check that this app hasn't already been dealt with
-    case lists:any(F, Apps) of
-        false ->
-            ProjOpts = rebar_state:opts(State),
-            Extras = rebar_dir:extra_src_dirs(ProjOpts, []),
-            [build_extra_dir(State, Dir) || Dir <- Extras];
-        true  -> ok
-    end.
-
-build_extra_dir(_State, []) -> ok;
-build_extra_dir(State, Dir) ->
-    case ec_file:is_dir(filename:join([rebar_state:dir(State), Dir])) of
-        true ->
-            BaseDir = filename:join([rebar_dir:base_dir(State), "extras"]),
-            OutDir = filename:join([BaseDir, Dir]),
-            filelib:ensure_dir(filename:join([OutDir, "dummy.beam"])),
-            copy(rebar_state:dir(State), BaseDir, Dir),
-            rebar_erlc_compiler:compile_dir(State, BaseDir, OutDir);
-        false -> ok
-    end.
 
 compile(State, AppInfo) ->
     compile(State, rebar_state:providers(State), AppInfo).
@@ -178,32 +106,6 @@ compile(State, Providers, AppInfo) ->
 %% Internal functions
 %% ===================================================================
 
-update_code_paths(State, ProjectApps, DepsPaths) ->
-    ProjAppsPaths = paths_for_apps(ProjectApps),
-    ExtrasPaths = paths_for_extras(State, ProjectApps),
-    rebar_state:code_paths(State, all_deps, DepsPaths ++ ProjAppsPaths ++ ExtrasPaths).
-
-paths_for_apps(Apps) -> paths_for_apps(Apps, []).
-
-paths_for_apps([], Acc) -> Acc;
-paths_for_apps([App|Rest], Acc) ->
-    {_SrcDirs, ExtraDirs} = resolve_src_dirs(rebar_app_info:opts(App)),
-    Paths = [filename:join([rebar_app_info:out_dir(App), Dir]) || Dir <- ["ebin"|ExtraDirs]],
-    FilteredPaths = lists:filter(fun ec_file:is_dir/1, Paths),
-    paths_for_apps(Rest, Acc ++ FilteredPaths).
-
-paths_for_extras(State, Apps) ->
-    F = fun(App) -> rebar_app_info:dir(App) == rebar_state:dir(State) end,
-    %% check that this app hasn't already been dealt with
-    case lists:any(F, Apps) of
-        false -> paths_for_extras(State);
-        true  -> []
-    end.
-
-paths_for_extras(State) ->
-    {_SrcDirs, ExtraDirs} = resolve_src_dirs(rebar_state:opts(State)),
-    Paths = [filename:join([rebar_dir:base_dir(State), "extras", Dir]) || Dir <- ExtraDirs],
-    lists:filter(fun ec_file:is_dir/1, Paths).
 
 has_all_artifacts(AppInfo1) ->
     case rebar_app_info:has_all_artifacts(AppInfo1) of
